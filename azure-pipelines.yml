@@ -6,13 +6,19 @@
 trigger:
 - main
 
-pool: neha-agent-pool
+jobs:
+- job: new_neha_job
+  displayName: 'New Neha Job'
+  pool:
+    vmImage: 'ubuntu-latest' # Or 'windows-latest' or 'macos-latest'
+  steps:
+  - script: echo "Hello world"
+    displayName: 'Echo Hello world'
 
-steps:
-- script: echo Hello, world!
-  displayName: 'Run a one-line script'
+  - script: echo Hello, world!
+    displayName: 'Run a one-line script'
 
-- script: |
-    echo Add other tasks to build, test, and deploy your project.
-    echo See https://aka.ms/yaml
-  displayName: 'Run a multi-line script'
+  - script: |
+      echo Add other tasks to build, test, and deploy your project.
+      echo See https://aka.ms/yaml
+    displayName: 'Run a multi-line script'
