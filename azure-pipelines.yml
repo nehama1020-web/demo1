@@ -9,8 +9,7 @@ trigger:
 jobs:
 - job: new_neha_job
   displayName: 'New Neha Job'
-  pool:
-    vmImage: 'ubuntu-latest' # Or 'windows-latest' or 'macos-latest'
+  pool:  neha-agent-pool
   steps:
   - script: echo "Hello world"
     displayName: 'Echo Hello world'
