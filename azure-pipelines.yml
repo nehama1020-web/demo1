@@ -6,8 +6,7 @@
 trigger:
 - main
 
-pool:
-  vmImage: neha-agent-pool
+pool: neha-agent-pool
 
 steps:
 - script: echo Hello, world!
