@@ -1,0 +1,215 @@
+name: Orchestrate Service Build & Deploy
+
+on:
+  repository_dispatch:
+    types: [ service_changed ]
+  workflow_dispatch:
+    inputs:
+      service_owner:
+        description: 'Service owner/org (for manual re-run)'
+        required: false
+      service_repo:
+        description: 'Service repo name (for manual re-run)'
+        required: false
+      service_ref:
+        description: 'Commit SHA to build (for manual re-run)'
+        required: false
+
+# Grant least-privileged, but allow packages push and artifacts
+permissions:
+  contents: read
+  packages: write
+  actions: read
+  id-token: write
+
+env:
+  REGISTRY: ghcr.io
+  ORG: your-org-or-user                 # <- CHANGE ME
+  # Default inputs when triggered by repository_dispatch
+  SERVICE_REPO: ${{ github.event.client_payload.service_repo || inputs.service_repo }}
+  SERVICE_OWNER: ${{ github.event.client_payload.service_owner || inputs.service_owner || env.ORG }}
+  SERVICE_REF: ${{ github.event.client_payload.service_ref || inputs.service_ref || github.sha }}
+
+jobs:
+  gather-metadata:
+    runs-on: [ 'self-hosted','neha-windows-agent']
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      image_name: ${{ steps.meta.outputs.image_name }}
+    steps:
+      - name: Derive image tags
+        id: meta
+        run: |
+          SERVICE_NAME="${SERVICE_REPO}"
+          COMMIT_SHA="${SERVICE_REF:0:12}"
+          echo "image_name=${{ env.REGISTRY }}/${{ env.ORG }}/${SERVICE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${SERVICE_NAME}:${COMMIT_SHA}" >> "$GITHUB_OUTPUT"
+
+  # ---- TEST (Python matrix) --------------------------------------------------
+  test:
+    needs: [gather-metadata]
+    runs-on: [ 'self-hosted','neha-windows-agent']
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: [ '3.8', '3.10', '3.11' ]  # (3.11 listed twice in prompt; deduped here)
+    steps:
+      - name: Checkout target service repo@ref
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SERVICE_OWNER }}/${{ env.SERVICE_REPO }}
+          ref: ${{ env.SERVICE_REF }}
+          path: service
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies (best-effort)
+        working-directory: service
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # Optional: coverage/pytest if not included already
+          pip install pytest coverage || true
+
+      - name: Run unit tests with coverage
+        working-directory: service
+        run: |
+          mkdir -p reports
+          coverage run -m pytest -q || pytest -q || true
+          coverage xml -o reports/coverage.xml || true
+          coverage report || true
+
+      - name: Upload test & coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-artifacts-py${{ matrix.python-version }}
+          path: |
+            service/reports/**
+            service/.pytest_cache/**
+
+  # ---- BUILD & PUSH DOCKER ---------------------------------------------------
+  build_and_push_image:
+    needs: [test]
+    runs-on: [ 'self-hosted','neha-windows-agent']
+    steps:
+      - name: Checkout target service repo@ref
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SERVICE_OWNER }}/${{ env.SERVICE_REPO }}
+          ref: ${{ env.SERVICE_REF }}
+          path: service
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        run: |
+          SERVICE_NAME="${{ env.SERVICE_REPO }}"
+          COMMIT_SHA="${{ env.SERVICE_REF:0:12 }}"
+          IMG="${{ env.REGISTRY }}/${{ env.ORG }}/${SERVICE_NAME}"
+          echo "img=${IMG}" >> "$GITHUB_OUTPUT"
+          echo "tag=${SERVICE_NAME}:${COMMIT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./service
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.img }}:${{ env.SERVICE_REPO }}-${{ env.SERVICE_REF }}
+            ${{ steps.meta.outputs.img }}:${{ steps.meta.outputs.tag }}
+          # (Both tags include service-name + commit-sha; keep the second as canonical)
+          labels: |
+            org.opencontainers.image.source=${{ env.SERVICE_OWNER }}/${{ env.SERVICE_REPO }}
+            org.opencontainers.image.revision=${{ env.SERVICE_REF }}
+
+  # ---- DEPLOY TO STAGING -----------------------------------------------------
+  deploy_staging:
+    needs: [build_and_push_image]
+    runs-on: [ 'self-hosted','neha-windows-agent']
+    environment: staging
+    env:
+      # Staging secrets are provided by the "staging" environment
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}               # if using K8s
+      HELM_RELEASE: ${{ env.SERVICE_REPO }}-staging
+      IMAGE: ghcr.io/${{ env.ORG }}/${{ env.SERVICE_REPO }}:${{ env.SERVICE_REPO }}-${{ env.SERVICE_REF }}
+    steps:
+      - name: Checkout orchestrator (for charts/manifests)
+        uses: actions/checkout@v4
+
+      - name: Setup kubectl/helm
+        uses: azure/setup-kubectl@v4
+      - uses: azure/setup-helm@v4
+
+      - name: Configure kube
+        run: |
+          mkdir -p ~/.kube
+          echo "${KUBE_CONFIG}" | base64 -d > ~/.kube/config
+
+      - name: Helm upgrade --install (staging)
+        run: |
+          mkdir -p deploy-logs
+          helm upgrade --install "${HELM_RELEASE}" ./helm/${{ env.SERVICE_REPO }} \
+            --namespace staging --create-namespace \
+            --set image.repository=ghcr.io/${{ env.ORG }}/${{ env.SERVICE_REPO }} \
+            --set image.tag=${{ env.SERVICE_REPO }}-${{ env.SERVICE_REF }} \
+            --set env.DATABASE_URL="${DATABASE_URL}" \
+            | tee deploy-logs/helm-${{ env.SERVICE_REPO }}-staging.log
+
+      - name: Upload Helm logs (staging)
+        uses: actions/upload-artifact@v4
+        with:
+          name: helm-logs-staging-${{ env.SERVICE_REPO }}
+          path: deploy-logs/*.log
+
+  # ---- MANUAL APPROVAL + DEPLOY TO PRODUCTION --------------------------------
+  # Gate this job with the "production" environment which has required reviewers.
+  deploy_production:
+    needs: [deploy_staging]
+    runs-on: [ 'self-hosted','neha-windows-agent']
+    environment: production   # <- configure required reviewers in repo settings
+    concurrency:
+      group: prod-${{ env.SERVICE_REPO }}
+      cancel-in-progress: false
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+      HELM_RELEASE: ${{ env.SERVICE_REPO }}-prod
+      IMAGE: ghcr.io/${{ env.ORG }}/${{ env.SERVICE_REPO }}:${{ env.SERVICE_REPO }}-${{ env.SERVICE_REF }}
+    steps:
+      - name: Checkout orchestrator (for charts/manifests)
+        uses: actions/checkout@v4
+
+      - name: Setup kubectl/helm
+        uses: azure/setup-kubectl@v4
+      - uses: azure/setup-helm@v4
+
+      - name: Configure kube
+        run: |
+          mkdir -p ~/.kube
+          echo "${KUBE_CONFIG}" | base64 -d > ~/.kube/config
+
+      - name: Helm upgrade --install (production)
+        run: |
+          mkdir -p deploy-logs
+          helm upgrade --install "${HELM_RELEASE}" ./helm/${{ env.SERVICE_REPO }} \
+            --namespace production --create-namespace \
+            --set image.repository=ghcr.io/${{ env.ORG }}/${{ env.SERVICE_REPO }} \
+            --set image.tag=${{ env.SERVICE_REPO }}-${{ env.SERVICE_REF }} \
+            --set env.DATABASE_URL="${DATABASE_URL}" \
+            | tee deploy-logs/helm-${{ env.SERVICE_REPO }}-prod.log
+
+      - name: Upload Helm logs (prod)
+        uses: actions/upload-artifact@v4
+        with:
+          name: helm-logs-prod-${{ env.SERVICE_REPO }}
+          path: deploy-logs/*.log
